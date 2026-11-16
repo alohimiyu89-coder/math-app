@@ -163,7 +163,7 @@ with tab1:
 上記の参考書リストの中から、最も優先して復習すべき章・番号・テーマを具体的に選び、指定されたJSON形式で出力してください。
 """
           response = client.models.generate_content(
-              model="gemini-2.5-flash",
+              model="gemini-3.8-flash",
               contents=[prompt] + images,
               config={
                   "response_mime_type": "application/json",
@@ -289,7 +289,7 @@ with tab3:
 複数枚の画像がある場合は、順番通りに統合してください。余計な挨拶文は不要で、整理した目次リストのみを出力してください。
 """
           response = client.models.generate_content(
-              model="gemini-2.5-flash", contents=[toc_prompt] + images
+              model="gemini-3.8-flash", contents=[toc_prompt] + images
           )
 
           current_text = st.session_state["toc_text"]
