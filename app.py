@@ -1,4 +1,5 @@
 from datetime import datetime
+import io
 import json
 import os
 import urllib.parse
@@ -64,14 +65,17 @@ class MathAnalysis(BaseModel):
   advice: str = Field(description="復習時に意識すべき具体的なアドバイス")
 
 
-# スマホ写真を軽量化＆向き補正する関数
+# スマホ写真を軽量JPEGに変換＆向き補正する関数（通信を高速化）
 def prepare_image(uploaded_file):
   img = Image.open(uploaded_file)
   img = ImageOps.exif_transpose(img)
   if img.mode != "RGB":
     img = img.convert("RGB")
-  img.thumbnail((1600, 1600))
-  return img
+  img.thumbnail((1200, 1200))
+  buf = io.BytesIO()
+  img.save(buf, format="JPEG", quality=80)
+  buf.seek(0)
+  return Image.open(buf)
 
 
 # Googleスプレッドシート（GAS）との通信関数
@@ -232,7 +236,7 @@ with tab1:
 
           prompt = f"""
 あなたは経験豊富な大学受験の数学講師です。
-生徒が共通テストの過去問で間違えた問題の画像（および途中計算があればその画像）を見て、詳しく分析・指導してください。
+生徒が共通テストの過去問で間違えた問題の画像（および途中計算があればその画像）を見て、簡潔かつ的確に分析・指導してください。
 
 【生徒が使っている参考書の項目一覧】
 {saved_toc}
@@ -345,7 +349,7 @@ with tab3:
   )
 
   toc_images = st.file_uploader(
-      "目次の写真をアップロード（1〜3枚ずつがおすすめ）",
+      "目次の写真をアップロード（1枚ずつが最速です）",
       type=["jpg", "jpeg", "png"],
       accept_multiple_files=True,
       key="toc_uploader",
@@ -362,15 +366,13 @@ with tab3:
     elif not toc_images:
       st.warning("目次の写真をアップロードしてください！")
     else:
-      with st.spinner("AIが目次の文字と問題番号を読み取り中（10〜20秒ほど）..."):
+      with st.spinner("AIが読み取り中（10〜20秒ほど・画面を閉じずにお待ちください）..."):
         try:
           client = genai.Client(api_key=api_key)
           images = [prepare_image(file) for file in toc_images]
 
           toc_prompt = """
-あなたは参考書の目次データを整理するアシスタントです。
-アップロードされた参考書の目次ページの画像から、「参考書名（分かれば）」「章・単元名」「問題番号（例題番号やページ番号）」「各問題のテーマ・タイトル」を漏れなく正確に読み取り、見やすいテキスト一覧にまとめてください。
-複数枚の画像がある場合は、順番通りに統合してください。余計な挨拶文は不要で、整理した目次リストのみを出力してください。
+参考書の目次画像から「章・単元名」「問題番号」「テーマ名」を簡潔な箇条書きで文字起こししてください。挨拶や説明は不要でリストのみ出力してください。
 """
           response = client.models.generate_content(
               model="gemini-3.8-flash", contents=[toc_prompt] + images
