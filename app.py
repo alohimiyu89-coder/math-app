@@ -5,6 +5,7 @@ import os
 import urllib.parse
 import urllib.request
 from google import genai
+from google.genai import types
 import pandas as pd
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
@@ -60,20 +61,51 @@ class MathAnalysis(BaseModel):
   )
   theme: str = Field(description="問題で問われている具体的なテーマ")
   weakness: str = Field(
-      description="欠如している知識やミスの原因の詳しい分析"
+      description="欠如している知識やミスの原因の簡潔な分析"
   )
   advice: str = Field(description="復習時に意識すべき具体的なアドバイス")
 
 
-# スマホ写真を軽量JPEGに変換＆向き補正する関数（通信を高速化）
+# AIを「即答モード（思考オフ）」で高速実行する関数
+def call_gemini_fast(client, contents, schema=None):
+  base_kwargs = {}
+  if schema:
+    base_kwargs["response_mime_type"] = "application/json"
+    base_kwargs["response_schema"] = schema
+
+  try:
+    fast_config = types.GenerateContentConfig(
+        **base_kwargs,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
+    return client.models.generate_content(
+        model="gemini-3.8-flash",
+        contents=contents,
+        config=fast_config,
+    )
+  except Exception as e:
+    err_str = str(e).lower()
+    if "thinking" in err_str or "budget" in err_str or "invalid" in err_str:
+      normal_config = (
+          types.GenerateContentConfig(**base_kwargs) if base_kwargs else None
+      )
+      return client.models.generate_content(
+          model="gemini-3.8-flash",
+          contents=contents,
+          config=normal_config,
+      )
+    raise e
+
+
+# スマホ写真を軽量JPEGに変換＆向き補正（アップロードを爆速化）
 def prepare_image(uploaded_file):
   img = Image.open(uploaded_file)
   img = ImageOps.exif_transpose(img)
   if img.mode != "RGB":
     img = img.convert("RGB")
-  img.thumbnail((1200, 1200))
+  img.thumbnail((1024, 1024))
   buf = io.BytesIO()
-  img.save(buf, format="JPEG", quality=80)
+  img.save(buf, format="JPEG", quality=75)
   buf.seek(0)
   return Image.open(buf)
 
@@ -84,7 +116,7 @@ def fetch_from_cloud():
     return None
   params = urllib.parse.urlencode({"key": app_password, "action": "load_all"})
   req = urllib.request.Request(f"{gas_url}?{params}", method="GET")
-  with urllib.request.urlopen(req, timeout=20) as res:
+  with urllib.request.urlopen(req, timeout=15) as res:
     return json.loads(res.read().decode("utf-8"))
 
 
@@ -99,7 +131,7 @@ def post_to_cloud(payload):
       headers={"Content-Type": "text/plain; charset=utf-8"},
       method="POST",
   )
-  with urllib.request.urlopen(req, timeout=20) as res:
+  with urllib.request.urlopen(req, timeout=15) as res:
     return json.loads(res.read().decode("utf-8"))
 
 
@@ -142,7 +174,7 @@ def save_history_all(df):
 if "cloud_loaded" not in st.session_state:
   if gas_url:
     try:
-      with st.spinner("☁️ Googleスプレッドシートからデータを読み込み中..."):
+      with st.spinner("☁️ スプレッドシートからデータを読み込み中..."):
         cloud_data = fetch_from_cloud()
         if cloud_data and cloud_data.get("status") == "ok":
           st.session_state["toc_text"] = cloud_data.get("toc", "")
@@ -159,9 +191,7 @@ if "cloud_loaded" not in st.session_state:
             st.session_state["history_df"] = pd.DataFrame(columns=COLUMNS)
           st.session_state["cloud_loaded"] = True
         else:
-          st.error(
-              f"スプレッドシートの読み込みに失敗しました（合言葉が一致しているか確認してください）: {cloud_data}"
-          )
+          st.error(f"スプレッドシート読み込み失敗: {cloud_data}")
           st.session_state["toc_text"] = load_local_toc()
           st.session_state["history_df"] = load_local_history()
           st.session_state["cloud_loaded"] = True
@@ -183,11 +213,9 @@ else:
     api_key = st.text_input("Gemini APIキーを入力", type="password")
 
 if gas_url:
-  st.caption("☁️ Googleスプレッドシート自動同期：ON（データは永久保存されます）")
+  st.caption("☁️ Googleスプレッドシート自動同期：ON（高速モード）")
 else:
-  st.caption(
-      "⚠️ ローカル保存モード（Secretsに GAS_URL を設定すると自動保存が有効になります）"
-  )
+  st.caption("⚠️ ローカル保存モード")
 
 tab1, tab2, tab3 = st.tabs(
     ["🔍 弱点分析する", "📋 復習リスト・履歴", "📖 参考書の登録"]
@@ -201,7 +229,7 @@ with tab1:
 
   if not saved_toc.strip():
     st.warning(
-        "⚠️ まだ参考書の目次が登録されていません！先に右端の **「📖 参考書の登録」** タブから目次の写真を読み取ってください。"
+        "⚠️ まだ参考書の目次が登録されていません！先に右端の **「📖 参考書の登録」** タブから参考書を登録してください。"
     )
   else:
     st.success(f"✅ 参考書リスト登録済み（現在 {len(saved_toc)} 文字）")
@@ -225,33 +253,24 @@ with tab1:
     if not api_key:
       st.error("Gemini APIキーが設定されていません！")
     elif not saved_toc.strip():
-      st.error("先に「📖 参考書の登録」タブで参考書の目次を登録してください！")
+      st.error("先に「📖 参考書の登録」タブで参考書を登録してください！")
     elif not uploaded_files:
       st.warning("間違えた問題の写真をアップロードしてください！")
     else:
-      with st.spinner("AIが問題と数式を読み取って分析中..."):
+      with st.spinner("⚡ AIが高速分析中（5〜10秒）..."):
         try:
           client = genai.Client(api_key=api_key)
           images = [prepare_image(file) for file in uploaded_files]
 
           prompt = f"""
-あなたは経験豊富な大学受験の数学講師です。
-生徒が共通テストの過去問で間違えた問題の画像（および途中計算があればその画像）を見て、簡潔かつ的確に分析・指導してください。
+あなたは大学受験の数学講師です。間違えた問題の画像を見て、以下の参考書リストから最も優先して復習すべき章・番号・テーマを選び、簡潔に分析してください。
 
-【生徒が使っている参考書の項目一覧】
+【生徒の参考書リスト】
 {saved_toc}
-
-上記の参考書リストの中から、最も優先して復習すべき章・番号・テーマを具体的に選び、指定されたJSON形式で出力してください。
 """
-          response = client.models.generate_content(
-              model="gemini-3.8-flash",
-              contents=[prompt] + images,
-              config={
-                  "response_mime_type": "application/json",
-                  "response_schema": MathAnalysis,
-              },
+          response = call_gemini_fast(
+              client, [prompt] + images, schema=MathAnalysis
           )
-
           result = json.loads(response.text)
 
           df = st.session_state["history_df"]
@@ -343,13 +362,42 @@ with tab2:
 # タブ3：参考書の目次登録画面
 # ==========================================
 with tab3:
-  st.subheader("📖 参考書の目次を写真から自動登録")
+  st.subheader("⚡ 方法①：参考書名から目次を自動作成（写真不要・5秒）")
   st.write(
-      "使っている参考書の目次ページを写真で撮ってアップロードすると、AIが項目一覧を自動で文字起こしし、スプレッドシートに永続保存します。"
+      "チャート式・基礎問題精講・Focus Goldなどの定番参考書は、名前を入れるだけでAIが目次リストを自動作成します。"
   )
+  book_name = st.text_input(
+      "参考書名を入力（例：青チャート 数学I+A、基礎問題精講 数学II+B）"
+  )
+  if st.button("⚡ 書名から目次リストを自動作成して保存", type="primary"):
+    if not api_key:
+      st.error("Gemini APIキーが設定されていません！")
+    elif not book_name.strip():
+      st.warning("参考書名を入力してください！")
+    else:
+      with st.spinner("⚡ 参考書の目次リストを自動生成中（5秒ほど）..."):
+        try:
+          client = genai.Client(api_key=api_key)
+          auto_prompt = f"""
+参考書「{book_name}」の章・単元名と、代表的な例題番号・テーマ一覧を簡潔な箇条書きで作成してください。余計な挨拶文は不要で、リストのみ出力してください。
+"""
+          response = call_gemini_fast(client, [auto_prompt])
+          current_text = st.session_state["toc_text"]
+          updated_text = (
+              (current_text.strip() + "\n\n" + response.text.strip())
+              if current_text.strip()
+              else response.text.strip()
+          )
+          save_toc_all(updated_text)
+          st.session_state["toc_text"] = updated_text
+          st.success(f"✅ 「{book_name}」の目次を作成して保存しました！")
+        except Exception as e:
+          st.error(f"エラーが発生しました: {e}")
 
+  st.divider()
+  st.subheader("📸 方法②：目次の写真から読み取る（1枚ずつ）")
   toc_images = st.file_uploader(
-      "目次の写真をアップロード（1枚ずつが最速です）",
+      "目次の写真をアップロード",
       type=["jpg", "jpeg", "png"],
       accept_multiple_files=True,
       key="toc_uploader",
@@ -360,37 +408,32 @@ with tab3:
     for i, file in enumerate(toc_images):
       cols[i].image(file, caption=f"目次 {i+1}")
 
-  if st.button("✨ 写真から目次を読み取って追加する", type="primary"):
+  if st.button("✨ 写真から目次を読み取って追加する"):
     if not api_key:
       st.error("Gemini APIキーが設定されていません！")
     elif not toc_images:
       st.warning("目次の写真をアップロードしてください！")
     else:
-      with st.spinner("AIが読み取り中（10〜20秒ほど・画面を閉じずにお待ちください）..."):
+      with st.spinner("⚡ 高速読み取り中（5〜10秒）..."):
         try:
           client = genai.Client(api_key=api_key)
           images = [prepare_image(file) for file in toc_images]
 
           toc_prompt = """
-参考書の目次画像から「章・単元名」「問題番号」「テーマ名」を簡潔な箇条書きで文字起こししてください。挨拶や説明は不要でリストのみ出力してください。
+画像の目次から「章・単元名」「問題番号」「テーマ名」だけを簡潔な箇条書きで抜き出してください。挨拶は不要です。
 """
-          response = client.models.generate_content(
-              model="gemini-3.8-flash", contents=[toc_prompt] + images
-          )
+          response = call_gemini_fast(client, [toc_prompt] + images)
 
           current_text = st.session_state["toc_text"]
-          if current_text.strip():
-            updated_text = (
-                current_text.strip() + "\n\n" + response.text.strip()
-            )
-          else:
-            updated_text = response.text.strip()
+          updated_text = (
+              (current_text.strip() + "\n\n" + response.text.strip())
+              if current_text.strip()
+              else response.text.strip()
+          )
 
           save_toc_all(updated_text)
           st.session_state["toc_text"] = updated_text
-          st.success(
-              "✅ 目次の読み取りとスプレッドシートへの保存が完了しました！"
-          )
+          st.success("✅ 目次の読み取りと保存が完了しました！")
 
         except Exception as e:
           st.error(f"エラーが発生しました: {e}")
