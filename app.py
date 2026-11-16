@@ -1,6 +1,8 @@
 from datetime import datetime
 import json
 import os
+import urllib.parse
+import urllib.request
 from google import genai
 import pandas as pd
 from PIL import Image, ImageOps
@@ -10,12 +12,14 @@ import streamlit as st
 st.set_page_config(page_title="数学 弱点分析＆参考書ナビ", layout="centered")
 st.title("📐 数学 弱点分析＆参考書ナビ")
 
-# クラウドの金庫（Secrets）からAPIキーと合言葉を読み込む
+# クラウドの金庫（Secrets）から設定を読み込む
 secret_api_key = ""
 app_password = ""
+gas_url = ""
 try:
   secret_api_key = st.secrets.get("GEMINI_API_KEY", "")
   app_password = st.secrets.get("APP_PASSWORD", "")
+  gas_url = st.secrets.get("GAS_URL", "")
 except Exception:
   pass
 
@@ -35,6 +39,15 @@ if app_password:
 
 HISTORY_FILE = "review_history.csv"
 TOC_FILE = "book_toc.txt"
+COLUMNS = [
+    "復習完了",
+    "日付",
+    "単元",
+    "やるべき参考書",
+    "問題テーマ",
+    "弱点・原因",
+    "アドバイス",
+]
 
 
 class MathAnalysis(BaseModel):
@@ -61,45 +74,102 @@ def prepare_image(uploaded_file):
   return img
 
 
-def load_history():
+# Googleスプレッドシート（GAS）との通信関数
+def fetch_from_cloud():
+  if not gas_url:
+    return None
+  params = urllib.parse.urlencode({"key": app_password, "action": "load_all"})
+  req = urllib.request.Request(f"{gas_url}?{params}", method="GET")
+  with urllib.request.urlopen(req, timeout=20) as res:
+    return json.loads(res.read().decode("utf-8"))
+
+
+def post_to_cloud(payload):
+  if not gas_url:
+    return None
+  payload["key"] = app_password
+  data = json.dumps(payload).encode("utf-8")
+  req = urllib.request.Request(
+      gas_url,
+      data=data,
+      headers={"Content-Type": "text/plain; charset=utf-8"},
+      method="POST",
+  )
+  with urllib.request.urlopen(req, timeout=20) as res:
+    return json.loads(res.read().decode("utf-8"))
+
+
+def load_local_history():
   if os.path.exists(HISTORY_FILE):
     df = pd.read_csv(HISTORY_FILE, dtype=str).fillna("")
     df["復習完了"] = df["復習完了"].map(lambda x: x == "True")
     return df
-  return pd.DataFrame(
-      columns=[
-          "復習完了",
-          "日付",
-          "単元",
-          "やるべき参考書",
-          "問題テーマ",
-          "弱点・原因",
-          "アドバイス",
-      ]
-  )
+  return pd.DataFrame(columns=COLUMNS)
 
 
-def save_history(df):
-  df_to_save = df.copy()
-  df_to_save["復習完了"] = df_to_save["復習完了"].astype(str)
-  df_to_save.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
-
-
-def load_toc():
+def load_local_toc():
   if os.path.exists(TOC_FILE):
     with open(TOC_FILE, "r", encoding="utf-8") as f:
       return f.read()
   return ""
 
 
-def save_toc(text):
+def save_toc_all(text):
   with open(TOC_FILE, "w", encoding="utf-8") as f:
     f.write(text)
+  if gas_url:
+    res = post_to_cloud({"action": "save_toc", "toc": text})
+    if not res or res.get("status") != "ok":
+      raise RuntimeError(f"スプレッドシート保存エラー: {res}")
 
 
-# セッションに目次データを保持（画面表示と確実に同期させるため）
-if "toc_text" not in st.session_state:
-  st.session_state["toc_text"] = load_toc()
+def save_history_all(df):
+  df_to_save = df.copy()
+  df_to_save["復習完了"] = df_to_save["復習完了"].astype(str)
+  df_to_save.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
+  if gas_url:
+    records = df.to_dict(orient="records")
+    res = post_to_cloud({"action": "save_history", "history": records})
+    if not res or res.get("status") != "ok":
+      raise RuntimeError(f"スプレッドシート保存エラー: {res}")
+
+
+# 初回起動時にスプレッドシートからデータを読み込む
+if "cloud_loaded" not in st.session_state:
+  if gas_url:
+    try:
+      with st.spinner("☁️ Googleスプレッドシートからデータを読み込み中..."):
+        cloud_data = fetch_from_cloud()
+        if cloud_data and cloud_data.get("status") == "ok":
+          st.session_state["toc_text"] = cloud_data.get("toc", "")
+          hist = cloud_data.get("history", [])
+          if hist:
+            df_cloud = pd.DataFrame(hist)
+            for col in COLUMNS:
+              if col not in df_cloud.columns:
+                df_cloud[col] = False if col == "復習完了" else ""
+            df_cloud = df_cloud[COLUMNS]
+            df_cloud["復習完了"] = df_cloud["復習完了"].astype(bool)
+            st.session_state["history_df"] = df_cloud
+          else:
+            st.session_state["history_df"] = pd.DataFrame(columns=COLUMNS)
+          st.session_state["cloud_loaded"] = True
+        else:
+          st.error(
+              f"スプレッドシートの読み込みに失敗しました（合言葉が一致しているか確認してください）: {cloud_data}"
+          )
+          st.session_state["toc_text"] = load_local_toc()
+          st.session_state["history_df"] = load_local_history()
+          st.session_state["cloud_loaded"] = True
+    except Exception as e:
+      st.error(f"スプレッドシート接続エラー: {e}")
+      st.session_state["toc_text"] = load_local_toc()
+      st.session_state["history_df"] = load_local_history()
+      st.session_state["cloud_loaded"] = True
+  else:
+    st.session_state["toc_text"] = load_local_toc()
+    st.session_state["history_df"] = load_local_history()
+    st.session_state["cloud_loaded"] = True
 
 if secret_api_key:
   api_key = secret_api_key
@@ -107,6 +177,13 @@ else:
   with st.sidebar:
     st.header("⚙️ 設定")
     api_key = st.text_input("Gemini APIキーを入力", type="password")
+
+if gas_url:
+  st.caption("☁️ Googleスプレッドシート自動同期：ON（データは永久保存されます）")
+else:
+  st.caption(
+      "⚠️ ローカル保存モード（Secretsに GAS_URL を設定すると自動保存が有効になります）"
+  )
 
 tab1, tab2, tab3 = st.tabs(
     ["🔍 弱点分析する", "📋 復習リスト・履歴", "📖 参考書の登録"]
@@ -173,16 +250,7 @@ with tab1:
 
           result = json.loads(response.text)
 
-          st.success("分析が完了し、「📋 復習リスト・履歴」に自動保存しました！")
-          st.info(
-              f"📌 **単元：** {result['unit']} ｜ 📖 **やるべき参考書：**"
-              f" {result['target_problems']}"
-          )
-          st.markdown(f"### 1. 問われているテーマ\n{result['theme']}")
-          st.markdown(f"### 2. 欠如している知識・つまずきポイント\n{result['weakness']}")
-          st.markdown(f"### 3. 復習のアドバイス\n{result['advice']}")
-
-          df = load_history()
+          df = st.session_state["history_df"]
           new_row = pd.DataFrame([{
               "復習完了": False,
               "日付": datetime.now().strftime("%Y/%m/%d %H:%M"),
@@ -193,7 +261,19 @@ with tab1:
               "アドバイス": result["advice"],
           }])
           df = pd.concat([new_row, df], ignore_index=True)
-          save_history(df)
+          save_history_all(df)
+          st.session_state["history_df"] = df
+
+          st.success(
+              "✅ 分析が完了し、Googleスプレッドシートに自動保存しました！"
+          )
+          st.info(
+              f"📌 **単元：** {result['unit']} ｜ 📖 **やるべき参考書：**"
+              f" {result['target_problems']}"
+          )
+          st.markdown(f"### 1. 問われているテーマ\n{result['theme']}")
+          st.markdown(f"### 2. 欠如している知識・つまずきポイント\n{result['weakness']}")
+          st.markdown(f"### 3. 復習のアドバイス\n{result['advice']}")
 
         except Exception as e:
           st.error(f"エラーが発生しました: {e}")
@@ -203,7 +283,7 @@ with tab1:
 # ==========================================
 with tab2:
   st.subheader("📋 あなたの復習リスト＆間違い履歴")
-  df = load_history()
+  df = st.session_state["history_df"]
 
   if df.empty:
     st.info(
@@ -246,10 +326,14 @@ with tab2:
     )
 
     if st.button("💾 チェック状態を保存する"):
-      df.update(edited_df)
-      save_history(df)
-      st.success("復習状況を保存しました！")
-      st.rerun()
+      try:
+        df.update(edited_df)
+        df["復習完了"] = df["復習完了"].astype(bool)
+        save_history_all(df)
+        st.session_state["history_df"] = df
+        st.success("✅ 復習状況をスプレッドシートに保存しました！")
+      except Exception as e:
+        st.error(f"保存エラー: {e}")
 
 # ==========================================
 # タブ3：参考書の目次登録画面
@@ -257,7 +341,7 @@ with tab2:
 with tab3:
   st.subheader("📖 参考書の目次を写真から自動登録")
   st.write(
-      "使っている参考書の目次ページを写真で撮ってアップロードすると、AIが項目一覧を自動で文字起こしします。"
+      "使っている参考書の目次ページを写真で撮ってアップロードすると、AIが項目一覧を自動で文字起こしし、スプレッドシートに永続保存します。"
   )
 
   toc_images = st.file_uploader(
@@ -300,10 +384,10 @@ with tab3:
           else:
             updated_text = response.text.strip()
 
-          save_toc(updated_text)
+          save_toc_all(updated_text)
           st.session_state["toc_text"] = updated_text
           st.success(
-              "✅ 目次の読み取りと保存が完了しました！下のリストに反映されています。"
+              "✅ 目次の読み取りとスプレッドシートへの保存が完了しました！"
           )
 
         except Exception as e:
@@ -317,5 +401,8 @@ with tab3:
       height=300,
   )
   if st.button("💾 手動編集した内容を保存する"):
-    save_toc(st.session_state["toc_text"])
-    st.success("✅ 参考書リストを保存しました！")
+    try:
+      save_toc_all(st.session_state["toc_text"])
+      st.success("✅ 参考書リストをスプレッドシートに保存しました！")
+    except Exception as e:
+      st.error(f"保存エラー: {e}")
