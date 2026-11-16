@@ -3,7 +3,7 @@ import json
 import os
 from google import genai
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 import streamlit as st
 
@@ -19,7 +19,7 @@ try:
 except Exception:
   pass
 
-# 合言葉ロック（APP_PASSWORDが設定されている場合のみ有効）
+# 合言葉ロック
 if app_password:
   if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -49,6 +49,16 @@ class MathAnalysis(BaseModel):
       description="欠如している知識やミスの原因の詳しい分析"
   )
   advice: str = Field(description="復習時に意識すべき具体的なアドバイス")
+
+
+# スマホ写真を軽量化＆向き補正する関数
+def prepare_image(uploaded_file):
+  img = Image.open(uploaded_file)
+  img = ImageOps.exif_transpose(img)
+  if img.mode != "RGB":
+    img = img.convert("RGB")
+  img.thumbnail((1600, 1600))
+  return img
 
 
 def load_history():
@@ -87,7 +97,10 @@ def save_toc(text):
     f.write(text)
 
 
-# APIキーの設定（金庫にあれば自動セット、なければ手入力）
+# セッションに目次データを保持（画面表示と確実に同期させるため）
+if "toc_text" not in st.session_state:
+  st.session_state["toc_text"] = load_toc()
+
 if secret_api_key:
   api_key = secret_api_key
 else:
@@ -103,13 +116,14 @@ tab1, tab2, tab3 = st.tabs(
 # タブ1：問題の分析画面
 # ==========================================
 with tab1:
-  saved_toc = load_toc()
+  saved_toc = st.session_state["toc_text"]
 
   if not saved_toc.strip():
     st.warning(
         "⚠️ まだ参考書の目次が登録されていません！先に右端の **「📖 参考書の登録」** タブから目次の写真を読み取ってください。"
     )
   else:
+    st.success(f"✅ 参考書リスト登録済み（現在 {len(saved_toc)} 文字）")
     with st.expander("📖 現在登録されている参考書リストを確認する"):
       st.text(saved_toc)
 
@@ -128,7 +142,7 @@ with tab1:
 
   if st.button("🔍 分析して復習リストに追加する", type="primary"):
     if not api_key:
-      st.error("左側のメニューから Gemini APIキー を入力してください！")
+      st.error("Gemini APIキーが設定されていません！")
     elif not saved_toc.strip():
       st.error("先に「📖 参考書の登録」タブで参考書の目次を登録してください！")
     elif not uploaded_files:
@@ -137,7 +151,7 @@ with tab1:
       with st.spinner("AIが問題と数式を読み取って分析中..."):
         try:
           client = genai.Client(api_key=api_key)
-          images = [Image.open(file) for file in uploaded_files]
+          images = [prepare_image(file) for file in uploaded_files]
 
           prompt = f"""
 あなたは経験豊富な大学受験の数学講師です。
@@ -247,7 +261,7 @@ with tab3:
   )
 
   toc_images = st.file_uploader(
-      "目次の写真をアップロード（複数ページまとめてOK）",
+      "目次の写真をアップロード（1〜3枚ずつがおすすめ）",
       type=["jpg", "jpeg", "png"],
       accept_multiple_files=True,
       key="toc_uploader",
@@ -260,14 +274,14 @@ with tab3:
 
   if st.button("✨ 写真から目次を読み取って追加する", type="primary"):
     if not api_key:
-      st.error("左側のメニューから Gemini APIキー を入力してください！")
+      st.error("Gemini APIキーが設定されていません！")
     elif not toc_images:
       st.warning("目次の写真をアップロードしてください！")
     else:
-      with st.spinner("AIが目次の文字と問題番号を読み取り中..."):
+      with st.spinner("AIが目次の文字と問題番号を読み取り中（10〜20秒ほど）..."):
         try:
           client = genai.Client(api_key=api_key)
-          images = [Image.open(file) for file in toc_images]
+          images = [prepare_image(file) for file in toc_images]
 
           toc_prompt = """
 あなたは参考書の目次データを整理するアシスタントです。
@@ -278,7 +292,7 @@ with tab3:
               model="gemini-2.5-flash", contents=[toc_prompt] + images
           )
 
-          current_text = load_toc()
+          current_text = st.session_state["toc_text"]
           if current_text.strip():
             updated_text = (
                 current_text.strip() + "\n\n" + response.text.strip()
@@ -287,19 +301,21 @@ with tab3:
             updated_text = response.text.strip()
 
           save_toc(updated_text)
-          st.success("目次の読み取りと保存が完了しました！")
-          st.rerun()
+          st.session_state["toc_text"] = updated_text
+          st.success(
+              "✅ 目次の読み取りと保存が完了しました！下のリストに反映されています。"
+          )
 
         except Exception as e:
           st.error(f"エラーが発生しました: {e}")
 
   st.divider()
   st.subheader("📝 登録済みの参考書リスト（手動での修正・削除もOK）")
-  edited_toc = st.text_area(
+  st.text_area(
       "ここに保存された内容を使ってAIが分析します",
-      value=load_toc(),
+      key="toc_text",
       height=300,
   )
   if st.button("💾 手動編集した内容を保存する"):
-    save_toc(edited_toc)
-    st.success("参考書リストを保存しました！")
+    save_toc(st.session_state["toc_text"])
+    st.success("✅ 参考書リストを保存しました！")
